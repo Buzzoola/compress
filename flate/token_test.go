@@ -1,54 +1,75 @@
 package flate
 
 import (
-	"bytes"
-	"io/ioutil"
+	"runtime"
+	"sync"
 	"testing"
 )
 
-type testFatal interface {
-	Fatal(args ...interface{})
+type chTookensPool struct {
+	ch chan *tokens
 }
 
-// loadTestTokens will load test tokens.
-// First block from enwik9, varint encoded.
-func loadTestTokens(t testFatal) *tokens {
-	b, err := ioutil.ReadFile("testdata/tokens.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var tokens tokens
-	err = tokens.FromVarInt(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &tokens
-}
-
-func Test_tokens_EstimatedBits(t *testing.T) {
-	tok := loadTestTokens(t)
-	// The estimated size, update if method changes.
-	const expect = 221057
-	n := tok.EstimatedBits()
-	var buf bytes.Buffer
-	wr := newHuffmanBitWriter(&buf)
-	wr.writeBlockDynamic(tok, true, nil, true)
-	if wr.err != nil {
-		t.Fatal(wr.err)
-	}
-	wr.flush()
-	t.Log("got:", n, "actual:", buf.Len()*8, "(header not part of estimate)")
-	if n != expect {
-		t.Error("want:", expect, "bits, got:", n)
+func (p *chTookensPool) Get() *tokens {
+	select {
+	case b := <-p.ch:
+		return b
+	default:
+		return &tokens{}
 	}
 }
 
-func Benchmark_tokens_EstimatedBits(b *testing.B) {
-	tok := loadTestTokens(b)
-	b.ResetTimer()
-	// One "byte", one token iteration.
-	b.SetBytes(1)
-	for i := 0; i < b.N; i++ {
-		_ = tok.EstimatedBits()
+func (p *chTookensPool) Put(t *tokens) {
+	select {
+	case p.ch <- t: // ok
+	default: // drop
 	}
+}
+
+func NewTokensPool(max int) *chTookensPool {
+	c := make(chan *tokens, max)
+	for i := 0; i < max; i++ {
+		c <- &tokens{}
+	}
+	return &chTookensPool{ch: c}
+}
+
+var tp = NewTokensPool(runtime.NumCPU())
+
+func BenchmarkTokensInitialization(b *testing.B) {
+	// BenchmarkTokensInitialization/stack-allocation-12         	   31321	     44704 ns/op	  270338 B/op	       1 allocs/op
+	b.Run("stack-allocation", func(b *testing.B) {
+		b.RunParallel(func(b *testing.PB) {
+			for b.Next() {
+				var dst tokens
+				_ = dst
+			}
+		})
+	})
+
+	// BenchmarkTokensInitialization/pool-allocation-12          	808984578	         1.522 ns/op	       0 B/op	       0 allocs/op
+	b.Run("pool-allocation", func(b *testing.B) {
+		b.RunParallel(func(b *testing.PB) {
+			pool := sync.Pool{
+				New: func() interface{} { return &tokens{} },
+			}
+			for b.Next() {
+				t := pool.Get().(*tokens)
+				pool.Put(t)
+
+			}
+		})
+	})
+
+	// Probably better on low RPS (?)
+	// BenchmarkTokensInitialization/chanels-allocation-12       	 9181482	       123.3 ns/op	       0 B/op	       0 allocs/op
+	b.Run("chanels-allocation", func(b *testing.B) {
+		b.RunParallel(func(b *testing.PB) {
+			for b.Next() {
+				t := tp.Get()
+				tp.Put(t)
+
+			}
+		})
+	})
 }
